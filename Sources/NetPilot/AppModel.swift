@@ -426,6 +426,18 @@ final class AppModel: ObservableObject {
         }
     }
 
+    nonisolated private static func probeOnce(ip: String) -> Double? {
+        let (code, out) = Shell.run("/usr/bin/curl", [
+            "--interface", ip, "-s", "-o", "/dev/null", "-m", "3",
+            "-w", "%{time_connect}",
+            "http://1.1.1.1/"
+        ])
+        guard code == 0 else { return nil }
+        let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let seconds = Double(trimmed), seconds > 0 else { return nil }
+        return seconds * 1000
+    }
+
     // MARK: - Samples
 
     private func pushSample(_ value: Double?) {
@@ -621,14 +633,10 @@ final class AppModel: ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             var results: [String: Double] = [:]
             for item in snapshot {
-                let (_, out) = Shell.run("/usr/bin/curl", [
-                    "--interface", item.ip, "-s", "-o", "/dev/null", "-m", "3",
-                    "-w", "%{time_connect}",
-                    "http://1.1.1.1/"
-                ])
-                let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let seconds = Double(trimmed), seconds > 0 {
-                    results[item.service] = seconds * 1000
+                if let ms = Self.probeOnce(ip: item.ip) {
+                    results[item.service] = ms
+                } else if let retry = Self.probeOnce(ip: item.ip) {
+                    results[item.service] = retry
                 }
             }
             let (_, routeOut) = Shell.run("/sbin/route", ["-n", "get", "default"])
