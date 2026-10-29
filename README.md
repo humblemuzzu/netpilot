@@ -24,8 +24,10 @@ The last one has a known cause. **AWDL** is the radio protocol behind AirDrop, H
 
 ## Features
 
+- **Smart DNS.** On every network it races the network's own resolver against Cloudflare, Google, Quad9 and OpenDNS, then uses the fastest reliable one with a working backup. It steps aside for Wi-Fi sign-in pages, networks that intercept DNS, and IPv6-only networks, remembers each network's choice, and re-checks itself. See [DNS policy](#dns-policy).
+- **Wi-Fi sign-in handling.** Detects captive portals the moment you join and when a hotel session expires mid-stay, puts DNS back on the network's own server so the page can load, and gives you a one-click **Sign in**. Shows the session time left on networks that publish it (RFC 8908).
 - **Live latency graph.** Full-width, colour-coded green / amber / red by value, with a 100 ms reference line. Hover to scrub back in time.
-- **Plain-English diagnosis.** Combines latency, loss, jitter and signal to name the likely problem instead of just showing numbers.
+- **Plain-English diagnosis that names the layer.** Tells you whether packets are lost between your Mac and the router ("the Wi-Fi is congested", "weak signal") or on the venue's internet line ("your Wi-Fi is fine"), and only claims loss when the evidence is statistically solid.
 - **Stutter fix (AWDL control).** One toggle. A small root helper keeps `awdl0` down and re-lowers it after reconnects and sleep/wake.
 - **Network ranking.** Scores your saved Wi-Fi networks on signal, band, channel congestion and gateway latency, with the reason for each.
 - **One-click join.** Joins a saved network directly. If macOS needs the password, the helper reads it from the System keychain.
@@ -38,9 +40,14 @@ The last one has a known cause. **AWDL** is the radio protocol behind AirDrop, H
 
 ```
 NetPilot.app  (SwiftUI MenuBarExtra, runs as your user, no root)
-├── latency   curl --interface <ip> → connectivitycheck.gstatic.com/generate_204
-│             TCP connect time per active interface, every 4 s
-├── radio     system_profiler SPAirPortDataType → RSSI, link rate (every 6 s)
+├── events    SCDynamicStore → network changes, DHCP resolvers, manual DNS (no polling)
+├── internet  TCP handshake to 1.1.1.1:443 and 8.8.8.8:443, bound to the
+│             primary interface, every 2 s (native sockets, 1 s timeout)
+├── router    ICMP echo to the default gateway every 2 s (unprivileged socket)
+├── radio     CoreWLAN → RSSI, noise, SNR, channel, link rate
+├── portal    captive.apple.com probe on join, every 60 s, and on outages
+├── DNS       raw DNS queries to each candidate resolver; writes the winner
+│             with networksetup -setdnsservers (admin, no password prompt)
 ├── traffic   netstat -ib + lsof → throughput and open connections (every 3 s)
 ├── ranking   roamr watch --json → scored saved networks (optional dependency)
 └── requests  writes /usr/local/etc/netpilot/{awdl_off, request.txt}
@@ -55,21 +62,25 @@ netpilotd     (root LaunchDaemon, ~120 lines of bash)
 Key design decisions:
 
 - **The UI never runs as root.** Only the helper does, and the helper is a short shell script so it can be audited in one sitting.
-- **Probes are bound to each interface.** `curl --interface` forces each measurement out of a specific link, so "Wi-Fi vs iPhone hotspot" is measured, not guessed.
-- **Latency is TCP connect time**, not ICMP. It reflects what real applications experience and works on networks that drop ping.
-- **Statistics are rolling.** Average latency, jitter (standard deviation) and loss are computed over the last 40 samples, about 160 seconds.
+- **Probes are bound to each interface** (`IP_BOUND_IF`), so "Wi-Fi vs iPhone hotspot" is measured, not guessed.
+- **Internet latency is TCP connect time**, not ICMP. Many cafés drop ping to the internet entirely. The 1 s timeout matches TCP's first SYN retransmit, so a lost packet is counted as lost instead of showing up as a fake 1000 ms sample.
+- **The router is pinged separately.** Loss to the internet with a clean router means the venue's line; loss to both means the Wi-Fi link.
+- **Loss is claimed only with evidence.** Over the last 90 probes (3 minutes) the app says "dropping packets" only when at least 3 probes failed and the 95% Wilson lower bound is at least 2%. A probe target that fails while the other works is that target's fault and is left out.
+- **Jitter is RFC 3550 interarrival jitter** (the smoothed figure call apps use), not a standard deviation.
+- **Latency shown is the median** of the last minute, so one spike doesn't define the number.
 - **No Xcode project.** A single Swift package builds the app; a script assembles and ad-hoc signs the `.app` bundle.
 
 ### Diagnosis rules
 
 | Condition | Headline |
 |---|---|
-| No successful probes | Offline |
-| Weak signal (≤ −75 dBm) and (loss ≥ 3% or jitter > 30 ms or latency ≥ 100 ms) | Unstable |
-| Loss ≥ 5% | Dropping packets |
-| Latency ≥ 100 ms | Slow |
+| Captive portal not signed in | Sign-in needed |
+| Last 3 probes all failed | Offline (says whether the router still answers) |
+| Loss proven, router also losing | Dropping packets: weak signal or congested Wi-Fi |
+| Loss proven, router clean | Dropping packets: the venue's internet line |
+| Median latency ≥ 100 ms | Slow (names the router if it is the slow part) |
 | Jitter > 30 ms | Choppy |
-| Weak signal only | Weak signal |
+| RSSI ≤ −72 dBm or SNR < 20 dB | Weak signal |
 | Latency 40–100 ms | Good |
 | Otherwise | Excellent |
 
@@ -107,7 +118,8 @@ Click the pulse icon in the menu bar.
 
 | Tab | What it shows |
 |---|---|
-| **Status** | Signal, loss, jitter and link rate; current traffic; toggles for the stutter fix, automatic network switching and link failover |
+| **Status** | Signal, loss, jitter and router latency; band, channel, link rate and SNR; current traffic; toggles for Smart DNS, the stutter fix, automatic network switching and link failover |
+| **DNS** | What Smart DNS chose and why, the servers in effect, and the last race: each resolver's typical time and how many queries it missed. **Test again** re-runs it |
 | **Networks** | Saved networks ranked best-first, with band and the reason for the ranking. **Join** switches immediately |
 | **Links** | Every active connection with live latency and a Primary marker. **Test speeds** runs a 2 MB download per link; **Prefer fastest** reorders services by the result |
 
@@ -140,7 +152,12 @@ macOS sends each connection out one default route, so two links do **not** add t
 ```
 Sources/NetPilot/
   main.swift         App entry point and menu bar scene
-  AppModel.swift     State, probes, roamr feed, switching and failover logic
+  AppModel.swift     State, network events, portal checks, roamr feed, switching and failover
+  NetState.swift     SCDynamicStore watcher: primary service, router, DHCP and manual DNS
+  Probe.swift        Native probes: TCP connect, raw DNS query, unprivileged ICMP echo
+  Health.swift       Rolling link statistics, loss evidence, CoreWLAN radio readings
+  SmartDNS.swift     Resolver race, decision, per-network memory and watchdog
+  Portal.swift       Captive portal detection and the RFC 8908 session API
   Traffic.swift      Interface byte counters and open-connection count
   Views.swift        Panel, tabs and the diagnosis rules
   Components.swift   Latency graph, theme colours, shared controls
@@ -164,31 +181,51 @@ Scripts/
 - The app runs unprivileged. The helper runs as root as a LaunchDaemon (`local.netpilot.daemon`) and does exactly two things: enforce the AWDL flag, and execute requests.
 - The app and helper communicate through files in `/usr/local/etc/netpilot`, which is owned `root:admin` and group-writable. **Any process running as an admin user can queue a request**, including joining a saved network or reordering services. This matches the access an admin already has through `networksetup`, but you should know the boundary.
 - To join a network the helper reads that network's saved password from the System keychain and passes it to `networksetup`. The password is never written to disk, logged, or returned to the app.
-- Probes contact `connectivitycheck.gstatic.com`. Speed tests download 2 MB from `speed.cloudflare.com`. Nothing else leaves your machine, and there is no telemetry.
+- Probes open (and immediately close) TCP connections to `1.1.1.1` and `8.8.8.8`, ping your router, fetch `captive.apple.com`, and send small DNS queries to the resolvers being compared. Speed tests download 2 MB from `speed.cloudflare.com`. There is no telemetry.
+- Smart DNS changes the DNS servers of the active network service through `networksetup`, which admin accounts may do without a password. It only ever writes to services it has changed itself or the current primary one, and puts them back to automatic when you move networks, turn Smart DNS off, or quit.
 - The helper logs to `/var/log/netpilot.log`.
 
 ### DNS policy
 
-DNS is the setting most likely to be left behind by the previous network, so it is
-decided on every network change rather than set once:
+macOS stores manual DNS per network *service* ("Wi-Fi"), not per Wi-Fi network, so a
+setting made at one hotel follows you to the next. And macOS uses the list in order:
+each lookup goes to the first server, is retried there, and only moves to the next
+after about three seconds of silence. So Smart DNS treats DNS as something to decide
+on every network, with the best server first and a working one second.
 
-1. **Stale cleanup.** A manual DNS server that is a private address outside the
-   current subnet is from another network — it is cleared.
-2. **Health comparison.** The network's own resolver (from DHCP) and `1.1.1.1`
-   are each asked four cold domains. Timeouts above 1.5s count against a server.
-3. **Ties go to the local resolver**, because it is on-LAN, cached, and returns
-   CDN edges near you. Cloudflare is only used when the local resolver is
-   measurably worse.
+1. **On arrival, step aside.** Any override from the previous network is removed at
+   once, so the new network's sign-in page works.
+2. **Wait for the portal check.** If the network wants a sign-in, DNS stays on the
+   network's own server until you are through.
+3. **Rule out unsafe overrides.** If a query to an address that runs no DNS server
+   gets an answer, the network intercepts all DNS and other servers would only be
+   imitated. If the network's resolver synthesises IPv6 addresses (DNS64), public
+   resolvers would break IPv4-only sites. Either way, the network's DNS is kept.
+4. **Race.** The network's resolver, Cloudflare, Google, Quad9 and OpenDNS each get
+   the same 24 queries at the same moment, one attempt each with a 1.2 s timeout.
+5. **Score fairly on lossy networks.** Packet loss on the venue's line hits every
+   resolver alike, so a resolver's misses only count against it when they are
+   significantly above the most reliable resolver's (two-proportion z-test). The
+   rest of the score is median plus a quarter of the 90th percentile.
+6. **Prefer the network's own resolver on near-ties** (15% bias): it is on the LAN and
+   points you at nearby CDN servers, which public resolvers that hide your subnet
+   (Cloudflare, Quad9) often cannot.
+7. **Don't flap.** A different server must be at least 20% and 8 ms better to
+   replace the current choice. The second slot always goes to the next-best
+   resolver from a different operator.
+8. **Remember and re-check.** The choice is stored per network and applied as soon
+   as you return. The race repeats every 20 minutes, and immediately if the server
+   in use fails twice in a row on three consecutive checks.
 
-Skipped entirely when a captive portal is detected, since the portal may depend
-on the DHCP resolver.
+Decisions are logged: `log show --last 1h --info --predicate 'subsystem == "local.netpilot"'`.
 
 ## Limitations
 
 - **Saved networks only.** macOS gates Wi-Fi scanning behind Location permission, so NetPilot ranks the networks you already know rather than scanning on its own.
 - **AWDL is enforced by polling** every 2 seconds, so a re-enable can survive for up to about 2 seconds.
 - **While the stutter fix is on**, AirDrop, Handoff, Universal Control and Sidecar are unavailable. Turn the toggle off to restore them.
-- Signal and link rate come from parsing `system_profiler` output, which Apple can change between macOS releases.
+- **Smart DNS uses plain DNS.** Encrypted DNS needs a signed network extension or a configuration profile, which an ad-hoc signed app cannot install.
+- **SSID needs roamr.** macOS hides the Wi-Fi name from apps without Location permission; NetPilot identifies networks by their configd profile ID instead, and shows the name when roamr provides it.
 
 ## Uninstall
 

@@ -1,5 +1,7 @@
+import AppKit
 import Foundation
 import SwiftUI
+import UserNotifications
 
 struct RankedNet: Identifiable, Equatable {
     let ssid: String
@@ -47,14 +49,25 @@ final class AppModel: ObservableObject {
     static let requestPath = dir + "/request.txt"
     static let daemonPlist = "/Library/LaunchDaemons/local.netpilot.daemon.plist"
 
+    nonisolated static let probeTargets = ["1.1.1.1", "8.8.8.8"]
+
+    let dns = SmartDNS()
+
     @Published var nets: [RankedNet] = []
     @Published var currentSSID = "—"
-    @Published var rssi = 0
-    @Published var linkRate = 0
+    @Published var wifi = WiFiReading()
     @Published var latency: Double = 0
+    @Published var current: Double?
     @Published var jitter: Double = 0
     @Published var loss: Double = 0
+    @Published var losingPackets = false
+    @Published var lossLayer: Layer = .none
+    @Published var offline = false
+    @Published var gatewayMs: Double?
     @Published var history: [Double] = []
+    @Published var network = NetSnapshot()
+    @Published var portal: PortalState = .unknown
+    @Published var portalSession: PortalSession?
     @Published var awdlOff = false
     @Published var ifaces: [IfaceResult] = []
     @Published var message = "" {
@@ -86,11 +99,18 @@ final class AppModel: ObservableObject {
     private var trafficTimer: Timer?
     private var countdownTimer: Timer?
     private var lastCounters: (bytes: Double, time: Date)?
-    private var dnsAuditedFor = ""
 
+    private let watcher = NetWatcher()
+    private var stats = LinkStats()
+    private var tickInFlight = false
+    private var ticks = 0
+    private var lastPortalCheck = Date.distantPast
+    private var portalCheckInFlight = false
+    private var notifiedSignInFor = ""
+
+    private var terminationSource: DispatchSourceSignal?
     private var roamrTask: Process?
     private var roamrBuffer = Data()
-    private var samples: [Double?] = []
     private var sysTimer: Timer?
     private var wifiDevice = "en0"
     private var started = false
@@ -103,10 +123,30 @@ final class AppModel: ObservableObject {
         wifiDevice = Self.detectWifiDevice()
         startRoamr()
         loadInterfaces()
-        pollSystem()
-        probeHealth()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.probeHealth() }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stop() }
+        }
+        signal(SIGTERM, SIG_IGN)
+        let termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        termination.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.stop() }
+            exit(0)
+        }
+        termination.resume()
+        terminationSource = termination
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.networkEvent(force: false)
+                self?.checkPortal()
+            }
+        }
+        watcher.onChange = { [weak self] in self?.networkEvent(force: false) }
+        watcher.start()
+        networkEvent(force: true)
+        tick()
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
         }
         RunLoop.main.add(healthTimer!, forMode: .common)
         sampleTraffic()
@@ -114,11 +154,10 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.sampleTraffic() }
         }
         RunLoop.main.add(trafficTimer!, forMode: .common)
-        sysTimer = Timer.scheduledTimer(withTimeInterval: 6, repeats: true) { [weak self] _ in
+        sysTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.pollSystem()
                 self?.refreshAWDLFlag()
-                self?.auditDNSIfNeeded()
+                self?.maybeCheckPortal()
             }
         }
         RunLoop.main.add(sysTimer!, forMode: .common)
@@ -132,10 +171,13 @@ final class AppModel: ObservableObject {
     }
 
     var menuSymbol: String {
-        latency >= 100 || loss >= 100 ? "exclamationmark.triangle" : "waveform.path.ecg"
+        if portal.needsSignIn { return "person.crop.circle.badge.exclamationmark" }
+        if offline { return "wifi.slash" }
+        return latency >= Theme.poorMs || losingPackets ? "exclamationmark.triangle" : "waveform.path.ecg"
     }
 
     func stop() {
+        dns.restoreAutomatic(reason: "NetPilot quit.")
         roamrTask?.terminate()
         sysTimer?.invalidate()
         healthTimer?.invalidate()
@@ -321,167 +363,108 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func auditDNSIfNeeded() {
-        guard !currentSSID.isEmpty, currentSSID != "—", dnsAuditedFor != currentSSID else { return }
-        dnsAuditedFor = currentSSID
-        auditDNS()
-        chooseDNS()
-    }
+    // MARK: - Network events
 
-    func chooseDNS() {
-        DispatchQueue.global(qos: .utility).async {
-            let (_, captive) = Shell.run("/usr/bin/curl", ["-s", "-m", "4", "http://captive.apple.com/hotspot-detect.html"])
-            guard captive.contains("Success") else { return }
-
-            let (_, summary) = Shell.run("/usr/sbin/ipconfig", ["getsummary", "en0"])
-            let localServers = Self.addresses(in: summary, key: "domain_name_server")
-            guard let localServer = localServers.first else { return }
-
-            let domains = ["railway.app", "bun.sh", "htmx.org", "deno.com"]
-            let localTimeouts = Self.probe(domains: domains, server: localServer)
-            let publicTimeouts = Self.probe(domains: domains, server: "1.1.1.1")
-
-            let target: [String]
-            if localTimeouts >= publicTimeouts + 2 {
-                target = ["1.1.1.1", "1.0.0.1"]
-            } else {
-                target = [localServer, "1.1.1.1"]
+    private func networkEvent(force: Bool) {
+        let snap = watcher.snapshot()
+        let moved = force || snap.networkKey != network.networkKey || snap.router != network.router
+            || snap.serviceID != network.serviceID || snap.address != network.address
+        network = snap
+        if moved {
+            dnsLog.info("network: \(snap.serviceName, privacy: .public) \(snap.interface, privacy: .public) router \(snap.router, privacy: .public) dhcp-dns \(snap.dhcpDNS.joined(separator: ","), privacy: .public) key \(snap.networkKey, privacy: .public)")
+            stats.reset()
+            publishStats()
+            portal = .unknown
+            portalSession = nil
+            notifiedSignInFor = ""
+            lastPortalCheck = .distantPast
+            dns.networkChanged(snap)
+            loadInterfaces()
+            if snap.online {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.checkPortal() }
             }
-
-            let (_, current) = Shell.run("/usr/sbin/networksetup", ["-getdnsservers", "Wi-Fi"])
-            let currentText = current.lowercased()
-            let alreadySet = target.allSatisfy { currentText.contains($0) }
-            if alreadySet && !currentText.contains("aren't any") { return }
-
-            if target.isEmpty {
-                Shell.run("/usr/sbin/networksetup", ["-setdnsservers", "Wi-Fi", "Empty"])
-            } else {
-                Shell.run("/usr/sbin/networksetup", ["-setdnsservers", "Wi-Fi"] + target)
-            }
-            Shell.run("/usr/bin/dscacheutil", ["-flushcache"])
-            Shell.run("/usr/bin/killall", ["-HUP", "mDNSResponder"])
-
-            Task { @MainActor in
-                self.message = target.first == "1.1.1.1"
-                    ? "This network's DNS is failing — using Cloudflare."
-                    : "Using this network's DNS, with Cloudflare as backup."
-            }
-        }
-    }
-
-    nonisolated private static func addresses(in text: String, key: String) -> [String] {
-        guard let range = text.range(of: key) else { return [] }
-        let tail = text[range.upperBound...].prefix(120)
-        return tail.split(whereSeparator: { "{} ,:()".contains($0) }).compactMap { token in
-            let parts = token.split(separator: ".")
-            guard parts.count == 4, parts.allSatisfy({ Int($0) != nil }) else { return nil }
-            return String(token)
-        }
-    }
-
-    nonisolated private static func probe(domains: [String], server: String) -> Int {
-        var timeouts = 0
-        for domain in domains {
-            let started = Date()
-            let (_, output) = Shell.run("/usr/bin/dig", ["@" + server, domain, "+short", "+tries=1", "+time=2"])
-            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || Date().timeIntervalSince(started) > 1.5 {
-                timeouts += 1
-            }
-        }
-        return timeouts
-    }
-
-    func auditDNS() {
-        DispatchQueue.global(qos: .utility).async {
-            let (_, configured) = Shell.run("/usr/sbin/networksetup", ["-getdnsservers", "Wi-Fi"])
-            let text = configured.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty, !text.lowercased().contains("aren't any") else { return }
-
-            let servers = text.components(separatedBy: "\n")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-
-            let (_, addressOut) = Shell.run("/usr/sbin/ipconfig", ["getifaddr", "en0"])
-            let address = addressOut.trimmingCharacters(in: .whitespacesAndNewlines)
-            let octets = address.split(separator: ".")
-            guard octets.count == 4 else { return }
-            let localSubnet = octets.dropLast().joined(separator: ".")
-
-            let stale = servers.filter { server in
-                let parts = server.split(separator: ".")
-                guard parts.count == 4 else { return false }
-                guard server.hasPrefix("192.168.") || server.hasPrefix("10.") || server.hasPrefix("172.") else { return false }
-                return parts.dropLast().joined(separator: ".") != localSubnet
-            }
-            guard !stale.isEmpty else { return }
-
-            Shell.run("/usr/sbin/networksetup", ["-setdnsservers", "Wi-Fi", "Empty"])
-            Shell.run("/usr/bin/dscacheutil", ["-flushcache"])
-            Shell.run("/usr/bin/killall", ["-HUP", "mDNSResponder"])
-
-            Task { @MainActor in
-                self.message = "Cleared a stale DNS server from another network — now using this one's."
-            }
-        }
-    }
-
-    nonisolated private static func probeOnce(ip: String) -> Double? {
-        let (code, out) = Shell.run("/usr/bin/curl", [
-            "--interface", ip, "-s", "-o", "/dev/null", "-m", "3",
-            "-w", "%{time_connect}",
-            "http://1.1.1.1/"
-        ])
-        guard code == 0 else { return nil }
-        let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let seconds = Double(trimmed), seconds > 0 else { return nil }
-        return seconds * 1000
-    }
-
-    // MARK: - Samples
-
-    private func pushSample(_ value: Double?) {
-        samples.append(value)
-        if samples.count > 40 { samples.removeFirst() }
-        let good = samples.compactMap { $0 }
-        guard !good.isEmpty else {
-            latency = 0; loss = 100; jitter = 0; history = []
-            return
-        }
-        loss = Double(samples.count - good.count) / Double(samples.count) * 100
-        latency = good.reduce(0, +) / Double(good.count)
-        if good.count > 1 {
-            let mean = latency
-            let variance = good.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(good.count)
-            jitter = variance.squareRoot()
         } else {
-            jitter = 0
+            dns.dhcpOrManualChanged(snap)
         }
-        history = Array(good.suffix(40))
     }
 
-    // MARK: - System state (RSSI, link rate)
+    // MARK: - Captive portal
 
-    private func pollSystem() {
-        DispatchQueue.global(qos: .utility).async {
-            let (_, output) = Shell.run("/usr/sbin/system_profiler", ["SPAirPortDataType"])
-            guard let marker = output.range(of: "Current Network Information:") else { return }
-            let block = String(output[marker.upperBound...].prefix(1200))
-            let rssi = Self.number(after: "Signal / Noise:", in: block)
-            let rate = Self.number(after: "Transmit Rate:", in: block)
-            Task { @MainActor in
-                if let rssi { self.rssi = Int(rssi) }
-                if let rate { self.linkRate = Int(rate) }
+    private func maybeCheckPortal() {
+        guard network.online else { return }
+        let elapsed = Date().timeIntervalSince(lastPortalCheck)
+        let interval: TimeInterval
+        switch portal {
+        case .signInRequired, .unknown, .unreachable: interval = 5
+        case .open: interval = offline ? 5 : 60
+        }
+        if elapsed >= interval { checkPortal() }
+        if let api = network.portalAPI, portal == .open,
+           Date().timeIntervalSince(portalSession?.checkedAt ?? .distantPast) > 300 {
+            portalSession = PortalSession(checkedAt: Date())
+            Task.detached(priority: .utility) {
+                let session = Portal.session(api: api)
+                await MainActor.run { if let session { self.portalSession = session } }
             }
         }
     }
 
-    nonisolated private static func number(after key: String, in text: String) -> Double? {
-        guard let range = text.range(of: key) else { return nil }
-        let tail = text[range.upperBound...]
-        let digits = tail.drop { !"0123456789-".contains($0) }
-        let token = digits.prefix { "0123456789.-".contains($0) }
-        return Double(token)
+    func checkPortal() {
+        guard !portalCheckInFlight, network.online else { return }
+        portalCheckInFlight = true
+        lastPortalCheck = Date()
+        let key = network.networkKey
+        Task.detached(priority: .utility) {
+            let state = Portal.check()
+            await MainActor.run {
+                self.portalCheckInFlight = false
+                guard key == self.network.networkKey else { return }
+                self.updatePortal(state)
+            }
+        }
+    }
+
+    private func updatePortal(_ state: PortalState) {
+        let was = portal
+        portal = state
+        if state != was { dnsLog.info("portal: \(String(describing: state), privacy: .public)") }
+        dns.portalChanged(state)
+        if state.needsSignIn, notifiedSignInFor != network.networkKey {
+            notifiedSignInFor = network.networkKey
+            notify(
+                title: was == .open ? "Wi-Fi signed you out" : "Sign in to Wi-Fi",
+                body: "\(displayName) needs you to sign in before the internet works. Open NetPilot to sign in."
+            )
+        }
+        if state == .open && was.needsSignIn {
+            notifiedSignInFor = ""
+            message = "Signed in — you're online."
+        }
+    }
+
+    func openSignIn() {
+        let target: URL
+        if let page = portalSession?.userPortal {
+            target = page
+        } else if case .signInRequired(let url) = portal {
+            target = url
+        } else {
+            target = Portal.probeURL
+        }
+        NSWorkspace.shared.open(target)
+    }
+
+    var displayName: String {
+        if currentSSID != "—", !currentSSID.isEmpty { return currentSSID }
+        return network.serviceName.isEmpty ? "This network" : network.serviceName
+    }
+
+    private func notify(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let request = UNNotificationRequest(identifier: "netpilot.signin", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
     nonisolated static func detectWifiDevice() -> String {
@@ -625,34 +608,69 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // MARK: - Dual link health
+    // MARK: - Link health
 
-    func probeHealth() {
-        let snapshot = ifaces.filter { !$0.service.lowercased().contains("tailscale") }
-        guard !snapshot.isEmpty else { return }
-        DispatchQueue.global(qos: .utility).async {
-            var results: [String: Double] = [:]
-            for item in snapshot {
-                if let ms = Self.probeOnce(ip: item.ip) {
-                    results[item.service] = ms
-                } else if let retry = Self.probeOnce(ip: item.ip) {
-                    results[item.service] = retry
+    func tick() {
+        guard !tickInFlight else { return }
+        tickInFlight = true
+        ticks += 1
+        let interface = network.interface
+        let gateway = network.router
+        let others = ifaces.filter { $0.device != interface && !$0.service.lowercased().contains("tailscale") }
+        let probeOthers = ticks % 3 == 0 && !others.isEmpty
+        Task.detached(priority: .utility) {
+            let lock = NSLock()
+            var internet = [Double?](repeating: nil, count: Self.probeTargets.count)
+            var gatewayMs: Double?
+            DispatchQueue.concurrentPerform(iterations: Self.probeTargets.count + 1) { index in
+                if index < Self.probeTargets.count {
+                    let ms = Probe.tcpConnect(Self.probeTargets[index], port: 443, interface: interface, timeout: 1)
+                    lock.lock(); internet[index] = ms; lock.unlock()
+                } else if !gateway.isEmpty {
+                    let ms = Probe.ping(gateway, timeout: 1)
+                    lock.lock(); gatewayMs = ms; lock.unlock()
                 }
             }
-            let (_, routeOut) = Shell.run("/sbin/route", ["-n", "get", "default"])
-            var activeDevice = ""
-            for line in routeOut.components(separatedBy: "\n") where line.contains("interface:") {
-                activeDevice = line.replacingOccurrences(of: "interface:", with: "")
-                    .trimmingCharacters(in: .whitespaces)
+            var otherHealth: [String: Double] = [:]
+            if probeOthers {
+                for item in others {
+                    if let ms = Probe.tcpConnect(Self.probeTargets[0], port: 443, interface: item.device, timeout: 1.5) {
+                        otherHealth[item.service] = ms
+                    }
+                }
             }
-            Task { @MainActor in
-                self.health = results
-                let primary = snapshot.first { $0.device == activeDevice }?.service ?? snapshot.first?.service
-                self.primaryService = primary ?? ""
-                if let primary { self.pushSample(results[primary]) }
+            let wifi = WiFiReading.read()
+            let tick = Tick(internet: internet, gateway: gatewayMs)
+            let measuredOthers = otherHealth
+            await MainActor.run {
+                self.tickInFlight = false
+                guard interface == self.network.interface else { return }
+                self.wifi = wifi
+                self.stats.add(tick)
+                self.publishStats()
+                let primary = self.ifaces.first { $0.device == interface }?.service ?? ""
+                self.primaryService = primary
+                if !primary.isEmpty { self.health[primary] = tick.internet.compactMap { $0 }.min() }
+                if probeOthers {
+                    for item in others { self.health[item.service] = measuredOthers[item.service] }
+                }
                 self.evaluateAutoSwitch()
+                if self.ticks % 15 == 0 { self.dns.watchdog(internetUp: !self.stats.offline) }
+                if self.stats.offline && self.portal == .open { self.checkPortal() }
             }
         }
+    }
+
+    private func publishStats() {
+        history = stats.history
+        current = stats.latest
+        latency = stats.median
+        jitter = stats.jitter
+        loss = stats.loss
+        losingPackets = stats.losingPackets
+        lossLayer = stats.lossLayer
+        offline = stats.offline
+        gatewayMs = stats.gatewayMedian
     }
 
     private func evaluateAutoSwitch() {

@@ -8,6 +8,7 @@ struct NetPilotApp: App {
         MenuBarExtra {
             PanelView()
                 .environmentObject(model)
+                .environmentObject(model.dns)
                 .onAppear { model.start() }
         } label: {
             Image(systemName: model.menuSymbol)
