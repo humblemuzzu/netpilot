@@ -342,16 +342,16 @@ final class AppModel: ObservableObject {
             let publicTimeouts = Self.probe(domains: domains, server: "1.1.1.1")
 
             let target: [String]
-            if localTimeouts <= publicTimeouts {
-                target = []
-            } else {
+            if localTimeouts >= publicTimeouts + 2 {
                 target = ["1.1.1.1", "1.0.0.1"]
+            } else {
+                target = [localServer, "1.1.1.1"]
             }
 
             let (_, current) = Shell.run("/usr/sbin/networksetup", ["-getdnsservers", "Wi-Fi"])
             let currentText = current.lowercased()
-            if target.isEmpty && currentText.contains("aren't any") { return }
-            if !target.isEmpty && currentText.contains("1.1.1.1") { return }
+            let alreadySet = target.allSatisfy { currentText.contains($0) }
+            if alreadySet && !currentText.contains("aren't any") { return }
 
             if target.isEmpty {
                 Shell.run("/usr/sbin/networksetup", ["-setdnsservers", "Wi-Fi", "Empty"])
@@ -362,9 +362,9 @@ final class AppModel: ObservableObject {
             Shell.run("/usr/bin/killall", ["-HUP", "mDNSResponder"])
 
             Task { @MainActor in
-                self.message = target.isEmpty
-                    ? "This network's DNS is healthy — using it directly."
-                    : "This network's DNS was failing — using Cloudflare instead."
+                self.message = target.first == "1.1.1.1"
+                    ? "This network's DNS is failing — using Cloudflare."
+                    : "Using this network's DNS, with Cloudflare as backup."
             }
         }
     }
