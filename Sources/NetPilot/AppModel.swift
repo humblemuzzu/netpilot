@@ -325,6 +325,71 @@ final class AppModel: ObservableObject {
         guard !currentSSID.isEmpty, currentSSID != "—", dnsAuditedFor != currentSSID else { return }
         dnsAuditedFor = currentSSID
         auditDNS()
+        chooseDNS()
+    }
+
+    func chooseDNS() {
+        DispatchQueue.global(qos: .utility).async {
+            let (_, captive) = Shell.run("/usr/bin/curl", ["-s", "-m", "4", "http://captive.apple.com/hotspot-detect.html"])
+            guard captive.contains("Success") else { return }
+
+            let (_, summary) = Shell.run("/usr/sbin/ipconfig", ["getsummary", "en0"])
+            let localServers = Self.addresses(in: summary, key: "domain_name_server")
+            guard let localServer = localServers.first else { return }
+
+            let domains = ["railway.app", "bun.sh", "htmx.org", "deno.com"]
+            let localTimeouts = Self.probe(domains: domains, server: localServer)
+            let publicTimeouts = Self.probe(domains: domains, server: "1.1.1.1")
+
+            let target: [String]
+            if localTimeouts <= publicTimeouts {
+                target = []
+            } else {
+                target = ["1.1.1.1", "1.0.0.1"]
+            }
+
+            let (_, current) = Shell.run("/usr/sbin/networksetup", ["-getdnsservers", "Wi-Fi"])
+            let currentText = current.lowercased()
+            if target.isEmpty && currentText.contains("aren't any") { return }
+            if !target.isEmpty && currentText.contains("1.1.1.1") { return }
+
+            if target.isEmpty {
+                Shell.run("/usr/sbin/networksetup", ["-setdnsservers", "Wi-Fi", "Empty"])
+            } else {
+                Shell.run("/usr/sbin/networksetup", ["-setdnsservers", "Wi-Fi"] + target)
+            }
+            Shell.run("/usr/bin/dscacheutil", ["-flushcache"])
+            Shell.run("/usr/bin/killall", ["-HUP", "mDNSResponder"])
+
+            Task { @MainActor in
+                self.message = target.isEmpty
+                    ? "This network's DNS is healthy — using it directly."
+                    : "This network's DNS was failing — using Cloudflare instead."
+            }
+        }
+    }
+
+    nonisolated private static func addresses(in text: String, key: String) -> [String] {
+        guard let range = text.range(of: key) else { return [] }
+        let tail = text[range.upperBound...].prefix(120)
+        return tail.split(whereSeparator: { "{} ,:()".contains($0) }).compactMap { token in
+            let parts = token.split(separator: ".")
+            guard parts.count == 4, parts.allSatisfy({ Int($0) != nil }) else { return nil }
+            return String(token)
+        }
+    }
+
+    nonisolated private static func probe(domains: [String], server: String) -> Int {
+        var timeouts = 0
+        for domain in domains {
+            let started = Date()
+            let (_, output) = Shell.run("/usr/bin/dig", ["@" + server, domain, "+short", "+tries=1", "+time=2"])
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || Date().timeIntervalSince(started) > 1.5 {
+                timeouts += 1
+            }
+        }
+        return timeouts
     }
 
     func auditDNS() {

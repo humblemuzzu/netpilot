@@ -167,6 +167,22 @@ Scripts/
 - Probes contact `connectivitycheck.gstatic.com`. Speed tests download 2 MB from `speed.cloudflare.com`. Nothing else leaves your machine, and there is no telemetry.
 - The helper logs to `/var/log/netpilot.log`.
 
+### DNS policy
+
+DNS is the setting most likely to be left behind by the previous network, so it is
+decided on every network change rather than set once:
+
+1. **Stale cleanup.** A manual DNS server that is a private address outside the
+   current subnet is from another network — it is cleared.
+2. **Health comparison.** The network's own resolver (from DHCP) and `1.1.1.1`
+   are each asked four cold domains. Timeouts above 1.5s count against a server.
+3. **Ties go to the local resolver**, because it is on-LAN, cached, and returns
+   CDN edges near you. Cloudflare is only used when the local resolver is
+   measurably worse.
+
+Skipped entirely when a captive portal is detected, since the portal may depend
+on the DHCP resolver.
+
 ## Limitations
 
 - **Saved networks only.** macOS gates Wi-Fi scanning behind Location permission, so NetPilot ranks the networks you already know rather than scanning on its own.
