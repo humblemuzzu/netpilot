@@ -622,9 +622,9 @@ final class AppModel: ObservableObject {
             var results: [String: Double] = [:]
             for item in snapshot {
                 let (_, out) = Shell.run("/usr/bin/curl", [
-                    "--interface", item.ip, "-s", "-o", "/dev/null", "-m", "4",
+                    "--interface", item.ip, "-s", "-o", "/dev/null", "-m", "3",
                     "-w", "%{time_connect}",
-                    "http://connectivitycheck.gstatic.com/generate_204"
+                    "http://1.1.1.1/"
                 ])
                 let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
                 if let seconds = Double(trimmed), seconds > 0 {
