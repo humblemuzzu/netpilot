@@ -84,7 +84,7 @@ Key design decisions:
 git clone https://github.com/humblemuzzu/netpilot.git
 cd netpilot
 
-# 1. Build the app, install to ~/Applications, start at login
+# 1. Build the app, install to /Applications, start at login
 ./Scripts/install-app.sh
 
 # 2. Install the root helper (needed for the stutter fix, password-based joins and failover)
@@ -93,7 +93,7 @@ sudo ./Scripts/install-daemon.sh
 
 The app works without step 2 in read-only mode: you still get the live graph, diagnosis, ranking and measurements. Anything that changes system state goes through the helper.
 
-NetPilot is ad-hoc signed and not notarized. If macOS blocks the first launch, right-click the app in `~/Applications` and choose **Open**.
+NetPilot is ad-hoc signed and not notarized. If macOS blocks the first launch, right-click the app in `/Applications` and choose **Open**.
 
 To build without installing: `./Scripts/build-app.sh` produces `build/NetPilot.app`.
 
@@ -148,7 +148,7 @@ Resources/
   local.netpilot.app.plist       Login-item template, rendered by install-app.sh
 Scripts/
   build-app.sh                   Release build and ad-hoc signed .app bundle
-  install-app.sh                 Build, install to ~/Applications, start at login
+  install-app.sh                 Build, install to /Applications, start at login
   install-daemon.sh              Install and load the root helper (sudo)
   uninstall-daemon.sh            Remove the helper and restore AWDL (sudo)
 ```
@@ -173,7 +173,7 @@ Scripts/
 ```sh
 sudo ./Scripts/uninstall-daemon.sh        # removes the helper and turns AWDL back on
 launchctl bootout gui/$(id -u)/local.netpilot.app
-rm -rf ~/Applications/NetPilot.app ~/Library/LaunchAgents/local.netpilot.app.plist
+rm -rf /Applications/NetPilot.app ~/Library/LaunchAgents/local.netpilot.app.plist
 ```
 
 ## Contributing

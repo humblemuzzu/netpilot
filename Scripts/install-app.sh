@@ -1,10 +1,10 @@
 #!/bin/bash
-# Builds NetPilot, installs it to ~/Applications and starts it at login.
+# Builds NetPilot, installs it to /Applications and starts it at login.
 # Runs as your user; the root helper is installed separately by install-daemon.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP_DIR="$HOME/Applications"
+APP_DIR="/Applications"
 AGENT_LABEL="local.netpilot.app"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 
