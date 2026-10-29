@@ -86,6 +86,7 @@ final class AppModel: ObservableObject {
     private var trafficTimer: Timer?
     private var countdownTimer: Timer?
     private var lastCounters: (bytes: Double, time: Date)?
+    private var dnsAuditedFor = ""
 
     private var roamrTask: Process?
     private var roamrBuffer = Data()
@@ -117,6 +118,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 self?.pollSystem()
                 self?.refreshAWDLFlag()
+                self?.auditDNSIfNeeded()
             }
         }
         RunLoop.main.add(sysTimer!, forMode: .common)
@@ -315,6 +317,46 @@ final class AppModel: ObservableObject {
                 self.activeConnections = counters.connections
                 self.busyTraffic = counters.connections >= 1 || self.bytesPerSec > 5_000
                 self.maybeAutoJoin()
+            }
+        }
+    }
+
+    func auditDNSIfNeeded() {
+        guard !currentSSID.isEmpty, currentSSID != "—", dnsAuditedFor != currentSSID else { return }
+        dnsAuditedFor = currentSSID
+        auditDNS()
+    }
+
+    func auditDNS() {
+        DispatchQueue.global(qos: .utility).async {
+            let (_, configured) = Shell.run("/usr/sbin/networksetup", ["-getdnsservers", "Wi-Fi"])
+            let text = configured.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty, !text.lowercased().contains("aren't any") else { return }
+
+            let servers = text.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+
+            let (_, addressOut) = Shell.run("/usr/sbin/ipconfig", ["getifaddr", "en0"])
+            let address = addressOut.trimmingCharacters(in: .whitespacesAndNewlines)
+            let octets = address.split(separator: ".")
+            guard octets.count == 4 else { return }
+            let localSubnet = octets.dropLast().joined(separator: ".")
+
+            let stale = servers.filter { server in
+                let parts = server.split(separator: ".")
+                guard parts.count == 4 else { return false }
+                guard server.hasPrefix("192.168.") || server.hasPrefix("10.") || server.hasPrefix("172.") else { return false }
+                return parts.dropLast().joined(separator: ".") != localSubnet
+            }
+            guard !stale.isEmpty else { return }
+
+            Shell.run("/usr/sbin/networksetup", ["-setdnsservers", "Wi-Fi", "Empty"])
+            Shell.run("/usr/bin/dscacheutil", ["-flushcache"])
+            Shell.run("/usr/bin/killall", ["-HUP", "mDNSResponder"])
+
+            Task { @MainActor in
+                self.message = "Cleared a stale DNS server from another network — now using this one's."
             }
         }
     }
